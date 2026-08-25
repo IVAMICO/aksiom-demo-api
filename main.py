@@ -188,7 +188,10 @@ async def create_demo_request(payload: DemoRequest, request: Request):
         # Honeypot tripped — return success so the bot doesn't learn anything, but drop it.
         return {"status": "received"}
 
-    client_ip = request.client.host if request.client else "unknown"
+    # Behind nginx, request.client.host is always the proxy's own address (127.0.0.1),
+    # not the real visitor — that made every visitor share one rate-limit bucket.
+    # X-Real-IP (set in the nginx config) carries the actual client IP.
+    client_ip = request.headers.get("x-real-ip") or (request.client.host if request.client else "unknown")
     check_rate_limit(client_ip)
 
     conn = get_db()
