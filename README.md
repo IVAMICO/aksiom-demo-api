@@ -1,20 +1,28 @@
 # aksiom-demo-api
 
 Tiny standalone service that receives "Request a Demo" submissions from
-aksiom-website. Separate from the real `aksiom_tp` product on purpose — this
-never touches customer financial data, so it can stay simple and public.
+aksiom-website, and a small internal dashboard for tracking them (assign to
+a team member, mark status, see upcoming requested call times). Separate
+from the real `aksiom_tp` product on purpose — this never touches customer
+financial data, so it can stay simple and public.
 
 ## What it does
 
 - `POST /api/demo-requests` — validates the submission, checks a honeypot
-  field, rate-limits by IP (5/hour), appends it to a local JSONL file.
-- `GET /api/demo-requests` — returns all stored submissions, but only if the
-  `X-Admin-Token` header matches the `ADMIN_TOKEN` environment variable.
+  field, rate-limits by IP (5/hour), stores it.
+- `GET /api/demo-requests` — returns all stored submissions as JSON. Requires
+  the `X-Admin-Token` header to match `ADMIN_TOKEN`.
+- `PATCH /api/demo-requests/{id}` — update a submission's `status` or
+  `assigned_to`. Same token required. Sends an email to the newly-assigned
+  person if SMTP is configured (see below).
+- `GET /api/admin?token=...` — the actual dashboard: status/owner counts,
+  upcoming requested call times, filterable table with inline-editable
+  status and owner dropdowns.
 - `GET /api/health` — for uptime checks.
 
-No database — submissions live in `data/demo_requests.jsonl`, one JSON object
-per line. Simple to `cat`/`tail`/`grep` over SSH, or fetch via the GET
-endpoint above.
+Storage is SQLite (`data/demo_requests.db`) — no separate database server
+needed, just a file, but supports real updates/filtering unlike the old
+JSONL approach.
 
 ## Local development
 
@@ -28,69 +36,47 @@ uv run uvicorn main:app --reload --port 8090
 `localhost:8090` in dev, so running both side by side just works — no CORS
 setup needed locally.
 
-## Deploying to the EC2 box (same box that runs aksiom_tp)
+## Deploying to the EC2 box
 
-1. **Copy the project over**, same pattern as `aksiom_tp/deploy.sh`:
-   ```bash
-   rsync -az --delete -e "ssh -i ~/.ssh/aksiom-key.pem" \
-     ~/projects/aksiom-demo-api/ ubuntu@18.195.138.117:~/aksiom-demo-api/ \
-     --exclude .venv --exclude data
-   ```
-
-2. **On the box**, install deps and pick a real admin token:
-   ```bash
-   cd ~/aksiom-demo-api
-   uv sync
-   openssl rand -hex 24   # use this as your ADMIN_TOKEN — save it somewhere safe
-   ```
-
-3. **Create a systemd service** at `/etc/systemd/system/aksiom-demo-api.service`:
-   ```ini
-   [Unit]
-   Description=Aksiom demo request API
-   After=network.target
-
-   [Service]
-   Type=simple
-   User=ubuntu
-   WorkingDirectory=/home/ubuntu/aksiom-demo-api
-   Environment=ADMIN_TOKEN=<paste the token from step 2>
-   Environment=ALLOWED_ORIGINS=https://aksiom.ai
-   Environment=DATA_DIR=/home/ubuntu/aksiom-demo-api/data
-   ExecStart=/home/ubuntu/.local/bin/uv run uvicorn main:app --host 127.0.0.1 --port 8090
-   Restart=on-failure
-
-   [Install]
-   WantedBy=multi-user.target
-   ```
-   Then:
-   ```bash
-   sudo systemctl daemon-reload
-   sudo systemctl enable --now aksiom-demo-api
-   ```
-
-4. **Add an nginx location block** to the `aksiom.ai` server block (the one
-   serving the marketing site), so the frontend's same-origin `/api/...`
-   fetch reaches this service — no CORS needed since it's the same domain:
-   ```nginx
-   location /api/ {
-       proxy_pass http://127.0.0.1:8090/api/;
-       proxy_set_header Host $host;
-       proxy_set_header X-Real-IP $remote_addr;
-   }
-   ```
-   Then `sudo nginx -t && sudo systemctl reload nginx`.
-
-5. **Check it's alive**: `curl https://aksiom.ai/api/health` should return
-   `{"status":"ok"}`.
-
-## Viewing submitted leads
+See `aksiom-website`'s deploy flow — same server, same nginx config. To
+update this service specifically after pushing changes to GitHub:
 
 ```bash
-curl https://aksiom.ai/api/demo-requests -H "X-Admin-Token: <your token>"
+cd ~/aksiom-demo-api && git pull && uv sync && sudo systemctl restart aksiom-demo-api
 ```
 
-Or just SSH in and `cat ~/aksiom-demo-api/data/demo_requests.jsonl`.
+Initial setup (first time only) is documented in the deploy history; the
+short version: `uv sync`, a systemd unit running
+`uv run uvicorn main:app --host 127.0.0.1 --port 8090`, and an nginx
+`location /api/ { proxy_pass http://127.0.0.1:8090/api/; }` block on the
+`aksiom.ai` server.
+
+## Email notifications on assignment
+
+Optional — assignment works fine without it, it just won't send an email
+until these are set. Since Aksiom already uses Google Workspace, the
+simplest path is a Gmail account with an **app password** (a regular
+password won't work for this):
+
+1. Go to your Google Account → **Security** → turn on **2-Step Verification**
+   if it isn't already on
+2. Go to **App passwords** (search for it in your Google Account settings),
+   create one named "Aksiom demo API"
+3. Add these to the systemd service's environment (same place `ADMIN_TOKEN`
+   is set), then `sudo systemctl restart aksiom-demo-api`:
+   ```
+   Environment=SMTP_USER=info@aksiom.ai
+   Environment=SMTP_PASSWORD=<the 16-character app password>
+   Environment=SMTP_FROM=info@aksiom.ai
+   ```
+
+## Viewing / managing leads
+
+Bookmark: `https://aksiom.ai/api/admin?token=<your ADMIN_TOKEN>`
+
+That's the dashboard — assign requests to Ivana/Vidak/Milo/Vuk, mark status
+(New / Contacted / Demo Scheduled / Demo Completed / Closed Won / Closed
+Lost), filter by owner or status, see upcoming requested call times.
 
 ## Known limitation
 
