@@ -41,9 +41,13 @@ class DemoRequest(BaseModel):
     name: str
     email: EmailStr
     company: str
+    country: str = ""
+    timezone: str = ""
     teamSize: str = ""
     erpCount: str = ""
     entityCount: str = ""
+    preferredDate: str = ""
+    preferredTime: str = ""
     message: str = ""
     website: str = ""  # honeypot field — real users never see or fill this
 
@@ -79,9 +83,13 @@ async def create_demo_request(payload: DemoRequest, request: Request):
         "name": payload.name,
         "email": payload.email,
         "company": payload.company,
+        "country": payload.country,
+        "timezone": payload.timezone,
         "team_size": payload.teamSize,
         "erp_systems": payload.erpCount,
         "entities": payload.entityCount,
+        "preferred_date": payload.preferredDate,
+        "preferred_time": payload.preferredTime,
         "message": payload.message,
     }
 
