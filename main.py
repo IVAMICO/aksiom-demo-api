@@ -6,6 +6,7 @@ import time
 from datetime import date, datetime, timezone
 from email.mime.text import MIMEText
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -33,6 +34,10 @@ SMTP_USER = os.environ.get("SMTP_USER", "")
 SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
 SMTP_FROM = os.environ.get("SMTP_FROM", SMTP_USER)
 ADMIN_URL = os.environ.get("ADMIN_URL", "https://aksiom.ai/api/admin")
+
+# Where the team is — preferred call times get converted to this so nobody
+# has to do the timezone math by hand when a US/APAC lead picks their own slot.
+TEAM_TIMEZONE = os.environ.get("TEAM_TIMEZONE", "Europe/Copenhagen")
 
 RATE_LIMIT_WINDOW_SECONDS = 3600
 RATE_LIMIT_MAX_PER_WINDOW = 5
@@ -149,6 +154,42 @@ def check_admin_token(token: str) -> None:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
+def team_local_dt(record: dict) -> datetime | None:
+    """The visitor's preferred call time, converted to TEAM_TIMEZONE. None if
+    there isn't enough info (missing date/time, or an unrecognized timezone)."""
+    if not (record["preferred_date"] and record["preferred_time"] and record["timezone"]):
+        return None
+    try:
+        visitor_dt = datetime.fromisoformat(
+            f"{record['preferred_date']}T{record['preferred_time']}"
+        ).replace(tzinfo=ZoneInfo(record["timezone"]))
+        return visitor_dt.astimezone(ZoneInfo(TEAM_TIMEZONE))
+    except Exception:
+        return None
+
+
+def format_preferred(record: dict) -> str:
+    """'2026-09-01 14:30' for the visitor alone, or with a converted team-time
+    and day-shift note appended when we have enough to compute one."""
+    date_, time_ = record["preferred_date"], record["preferred_time"]
+    if not (date_ or time_):
+        return ""
+    visitor_part = f"{date_} {time_}".strip()
+
+    team_dt = team_local_dt(record)
+    if team_dt is None:
+        return visitor_part
+
+    visitor_date = date_
+    day_shift = ""
+    if team_dt.date().isoformat() > visitor_date:
+        day_shift = " (+1 day)"
+    elif team_dt.date().isoformat() < visitor_date:
+        day_shift = " (-1 day)"
+
+    return f"{visitor_part} → {team_dt.strftime('%H:%M')} our time{day_shift}"
+
+
 def send_assignment_email(assignee_name: str, record: dict) -> None:
     if not SMTP_USER or not SMTP_PASSWORD:
         return  # not configured yet — assignment still works, just no email
@@ -164,7 +205,7 @@ def send_assignment_email(assignee_name: str, record: dict) -> None:
         f"Company: {record['company']}\n"
         f"Country: {record['country']}\n"
         f"Timezone: {record['timezone']}\n"
-        f"Preferred contact: {record['preferred_date']} {record['preferred_time']}\n"
+        f"Preferred contact: {format_preferred(record) or '(not specified)'}\n"
         f"Message: {record['message']}\n\n"
         f"View all requests: {ADMIN_URL}?token={ADMIN_TOKEN}\n"
     )
@@ -281,11 +322,25 @@ async def admin_view(token: str = "", assignee: str = "", status: str = ""):
         if not r["assigned_to"]:
             unassigned_count += 1
 
-    today = date.today().isoformat()
-    upcoming = sorted(
-        (r for r in rows if r["preferred_date"] and r["preferred_date"] >= today and r["status"] not in ("Closed Won", "Closed Lost")),
-        key=lambda r: (r["preferred_date"], r["preferred_time"] or "99:99"),
-    )[:8]
+    # Sort/filter "upcoming" by the actual instant in the team's timezone when we
+    # can compute one — a US evening slot can land on a different calendar day
+    # for us, so comparing raw visitor-local date strings would misorder things.
+    team_today = datetime.now(ZoneInfo(TEAM_TIMEZONE)).date().isoformat()
+
+    def upcoming_sort_key(r):
+        team_dt = team_local_dt(r)
+        if team_dt is not None:
+            return (0, team_dt.isoformat())
+        return (1, r["preferred_date"], r["preferred_time"] or "99:99")
+
+    def is_upcoming(r):
+        if not r["preferred_date"] or r["status"] in ("Closed Won", "Closed Lost"):
+            return False
+        team_dt = team_local_dt(r)
+        reference_date = team_dt.date().isoformat() if team_dt is not None else r["preferred_date"]
+        return reference_date >= team_today
+
+    upcoming = sorted((r for r in rows if is_upcoming(r)), key=upcoming_sort_key)[:8]
 
     # --- filters ---
     visible = rows
@@ -321,7 +376,7 @@ async def admin_view(token: str = "", assignee: str = "", status: str = ""):
           <td>{esc(r['email'])}</td>
           <td>{esc(r['company'])}</td>
           <td>{esc(r['country'])}</td>
-          <td>{esc(r['preferred_date'])} {esc(r['preferred_time']) if r['preferred_time'] else ''}</td>
+          <td>{esc(format_preferred(r))}</td>
           <td>{esc(r['message'])}</td>
           <td><select onchange="updateField({r['id']}, 'status', this.value)">{status_opts}</select></td>
           <td><select onchange="updateField({r['id']}, 'assigned_to', this.value)">{assignee_opts}</select></td>
@@ -339,7 +394,7 @@ async def admin_view(token: str = "", assignee: str = "", status: str = ""):
     )
 
     upcoming_html = "".join(
-        f'<li><strong>{esc(r["preferred_date"])} {esc(r["preferred_time"])}</strong> — {esc(r["name"])} ({esc(r["company"])}) '
+        f'<li><strong>{esc(format_preferred(r))}</strong> — {esc(r["name"])} ({esc(r["company"])}) '
         f'<span class="muted">{esc(r["assigned_to"]) if r["assigned_to"] else "unassigned"}</span></li>'
         for r in upcoming
     ) or '<li class="muted">Nothing scheduled.</li>'
