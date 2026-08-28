@@ -8,7 +8,7 @@ from email.mime.text import MIMEText
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, EmailStr, field_validator
@@ -50,6 +50,11 @@ TEAM = {
 }
 
 STATUSES = ["New", "Contacted", "Demo Scheduled", "Demo Completed", "Closed Won", "Closed Lost"]
+
+# What the "By status" panel shows on a fresh visit — the three end states are
+# excluded since a finished lead isn't part of the day-to-day overview anymore.
+# Still viewable any time by clicking their badge in.
+DEFAULT_STATUS_FILTER = [s for s in STATUSES if s not in ("Demo Completed", "Closed Won", "Closed Lost")]
 
 app = FastAPI(title="Aksiom Demo Request API")
 
@@ -303,7 +308,7 @@ async def update_demo_request(request_id: int, payload: UpdateRequest, x_admin_t
 
 
 @app.get("/api/admin", response_class=HTMLResponse)
-async def admin_view(token: str = "", assignee: str = "", status: str = ""):
+async def admin_view(token: str = "", assignee: str = "", status: list[str] = Query(default=None)):
     if token != ADMIN_TOKEN or not ADMIN_TOKEN:
         return HTMLResponse(
             "<p style='font-family:sans-serif;padding:2rem'>"
@@ -348,16 +353,31 @@ async def admin_view(token: str = "", assignee: str = "", status: str = ""):
     upcoming = sorted((r for r in rows if is_upcoming(r)), key=upcoming_sort_key)[:8]
 
     # --- filters ---
+    # No `status` params at all means a fresh visit — default to hiding the
+    # three end states, since a finished lead isn't part of the day-to-day
+    # overview. Any explicit status selection (including re-picking the same
+    # trio via "Clear filters") is honored exactly as given.
+    selected_statuses = set(status) if status is not None else set(DEFAULT_STATUS_FILTER)
+
     visible = rows
     if assignee:
         visible = [r for r in visible if r["assigned_to"] == assignee]
-    if status:
-        visible = [r for r in visible if r["status"] == status]
+    visible = [r for r in visible if r["status"] in selected_statuses]
 
-    def qs(**overrides):
-        params = {"token": token, "assignee": assignee, "status": status}
-        params.update(overrides)
-        return "&".join(f"{k}={html.escape(v)}" for k, v in params.items() if v)
+    def build_qs(assignee_val: str | None = None, status_set: set[str] | None = None) -> str:
+        if assignee_val is None:
+            assignee_val = assignee
+        if status_set is None:
+            status_set = selected_statuses
+        parts = []
+        if token:
+            parts.append(f"token={html.escape(token)}")
+        if assignee_val:
+            parts.append(f"assignee={html.escape(assignee_val)}")
+        for s in STATUSES:
+            if s in status_set:
+                parts.append(f"status={html.escape(s)}")
+        return "&".join(parts)
 
     def esc(v) -> str:
         return html.escape(str(v)) if v else "—"
@@ -392,12 +412,18 @@ async def admin_view(token: str = "", assignee: str = "", status: str = ""):
 
     rows_html = "".join(row_html(r) for r in visible) or '<tr><td colspan="10" class="empty">No requests match this filter.</td></tr>'
 
+    def toggled(s: str) -> set[str]:
+        new_set = set(selected_statuses)
+        new_set.symmetric_difference_update({s})
+        return new_set
+
     status_badges = "".join(
-        f'<a class="badge {"active" if status == s else ""}" href="/api/admin?{qs(status="" if status == s else s)}">{s}: {status_counts[s]}</a>'
+        f'<a class="badge {"active" if s in selected_statuses else ""}" '
+        f'href="/api/admin?{build_qs(status_set=toggled(s))}">{s}: {status_counts[s]}</a>'
         for s in STATUSES
     )
     assignee_badges = "".join(
-        f'<a class="badge {"active" if assignee == a else ""}" href="/api/admin?{qs(assignee="" if assignee == a else a)}">{a}: {assignee_counts[a]}</a>'
+        f'<a class="badge {"active" if assignee == a else ""}" href="/api/admin?{build_qs(assignee_val="" if assignee == a else a)}">{a}: {assignee_counts[a]}</a>'
         for a in TEAM
     )
 
@@ -408,7 +434,8 @@ async def admin_view(token: str = "", assignee: str = "", status: str = ""):
         for r in upcoming
     ) or '<li class="muted">Nothing scheduled.</li>'
 
-    clear_filters = '<a class="clear" href="/api/admin?token=' + html.escape(token) + '">Clear filters</a>' if (assignee or status) else ''
+    is_default_view = not assignee and selected_statuses == set(DEFAULT_STATUS_FILTER)
+    clear_filters = '<a class="clear" href="/api/admin?token=' + html.escape(token) + '">Clear filters</a>' if not is_default_view else ''
 
     page = f"""
     <!doctype html>
