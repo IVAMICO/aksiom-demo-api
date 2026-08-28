@@ -168,26 +168,31 @@ def team_local_dt(record: dict) -> datetime | None:
         return None
 
 
-def format_preferred(record: dict) -> str:
-    """'2026-09-01 14:30' for the visitor alone, or with a converted team-time
-    and day-shift note appended when we have enough to compute one."""
+def format_visitor_time(record: dict) -> str:
+    """The customer's preferred slot exactly as they picked it, e.g. 'Tue 1 Sep, 14:30'."""
     date_, time_ = record["preferred_date"], record["preferred_time"]
-    if not (date_ or time_):
+    if not (date_ and time_):
         return ""
-    visitor_part = f"{date_} {time_}".strip()
+    try:
+        return datetime.fromisoformat(f"{date_}T{time_}").strftime("%a %-d %b, %H:%M")
+    except Exception:
+        return f"{date_} {time_}".strip()
 
+
+def format_team_time(record: dict) -> str:
+    """The same slot converted to TEAM_TIMEZONE, e.g. 'Wed 2 Sep, 02:00 (next day)'.
+    Empty if we don't have enough to compute one (missing date/time, or an
+    unrecognized timezone) — the customer's own time still stands on its own."""
     team_dt = team_local_dt(record)
     if team_dt is None:
-        return visitor_part
-
-    visitor_date = date_
-    day_shift = ""
-    if team_dt.date().isoformat() > visitor_date:
-        day_shift = " (+1 day)"
-    elif team_dt.date().isoformat() < visitor_date:
-        day_shift = " (-1 day)"
-
-    return f"{visitor_part} → {team_dt.strftime('%H:%M')} our time{day_shift}"
+        return ""
+    label = team_dt.strftime("%a %-d %b, %H:%M")
+    team_date = team_dt.date().isoformat()
+    if team_date > record["preferred_date"]:
+        label += " (next day)"
+    elif team_date < record["preferred_date"]:
+        label += " (previous day)"
+    return label
 
 
 def send_assignment_email(assignee_name: str, record: dict) -> None:
@@ -204,8 +209,8 @@ def send_assignment_email(assignee_name: str, record: dict) -> None:
         f"Email: {record['email']}\n"
         f"Company: {record['company']}\n"
         f"Country: {record['country']}\n"
-        f"Timezone: {record['timezone']}\n"
-        f"Preferred contact: {format_preferred(record) or '(not specified)'}\n"
+        f"Customer's preferred time: {format_visitor_time(record) or '(not specified)'}\n"
+        f"Your time (Copenhagen): {format_team_time(record) or 'n/a — missing timezone or time'}\n"
         f"Message: {record['message']}\n\n"
         f"View all requests: {ADMIN_URL}?token={ADMIN_TOKEN}\n"
     )
@@ -369,6 +374,8 @@ async def admin_view(token: str = "", assignee: str = "", status: str = ""):
         )
         stale = r["status"] == "New" and (datetime.now(timezone.utc) - datetime.fromisoformat(r["received_at"])).days >= 2
         row_class = "stale" if stale else ""
+        team_time = format_team_time(r)
+        team_time_class = "day-shift" if ("next day" in team_time or "previous day" in team_time) else ""
         return f"""
         <tr class="{row_class}">
           <td>{esc(r['received_at'][:10])}</td>
@@ -376,13 +383,14 @@ async def admin_view(token: str = "", assignee: str = "", status: str = ""):
           <td>{esc(r['email'])}</td>
           <td>{esc(r['company'])}</td>
           <td>{esc(r['country'])}</td>
-          <td>{esc(format_preferred(r))}</td>
+          <td>{esc(format_visitor_time(r))}</td>
+          <td class="{team_time_class}">{esc(team_time)}</td>
           <td>{esc(r['message'])}</td>
           <td><select onchange="updateField({r['id']}, 'status', this.value)">{status_opts}</select></td>
           <td><select onchange="updateField({r['id']}, 'assigned_to', this.value)">{assignee_opts}</select></td>
         </tr>"""
 
-    rows_html = "".join(row_html(r) for r in visible) or '<tr><td colspan="9" class="empty">No requests match this filter.</td></tr>'
+    rows_html = "".join(row_html(r) for r in visible) or '<tr><td colspan="10" class="empty">No requests match this filter.</td></tr>'
 
     status_badges = "".join(
         f'<a class="badge {"active" if status == s else ""}" href="/api/admin?{qs(status="" if status == s else s)}">{s}: {status_counts[s]}</a>'
@@ -394,8 +402,9 @@ async def admin_view(token: str = "", assignee: str = "", status: str = ""):
     )
 
     upcoming_html = "".join(
-        f'<li><strong>{esc(format_preferred(r))}</strong> — {esc(r["name"])} ({esc(r["company"])}) '
-        f'<span class="muted">{esc(r["assigned_to"]) if r["assigned_to"] else "unassigned"}</span></li>'
+        f'<li><strong>{esc(format_team_time(r) or format_visitor_time(r))}</strong> — {esc(r["name"])} ({esc(r["company"])}) '
+        f'<span class="muted">customer: {esc(format_visitor_time(r))} · '
+        f'{esc(r["assigned_to"]) if r["assigned_to"] else "unassigned"}</span></li>'
         for r in upcoming
     ) or '<li class="muted">Nothing scheduled.</li>'
 
@@ -429,6 +438,7 @@ async def admin_view(token: str = "", assignee: str = "", status: str = ""):
         tr:hover td {{ background: #13161C; }}
         tr.stale td {{ background: rgba(232, 178, 90, 0.05); }}
         tr.stale td:first-child {{ box-shadow: inset 3px 0 0 #E8B25A; }}
+        td.day-shift {{ color: #E8B25A; font-weight: 600; }}
         td {{ max-width: 200px; overflow: hidden; text-overflow: ellipsis; color: #C8CDD5; }}
         td.empty {{ color: #5A6170; text-align: center; padding: 2rem; }}
         select {{ background: #0B0D11; color: #E6E8EC; border: 1px solid #2A2F39; border-radius: 4px; padding: 0.3rem 0.4rem; font-size: 0.75rem; }}
@@ -456,7 +466,7 @@ async def admin_view(token: str = "", assignee: str = "", status: str = ""):
       <table>
         <thead><tr>
           <th>Received</th><th>Name</th><th>Email</th><th>Company</th><th>Country</th>
-          <th>Preferred</th><th>Message</th><th>Status</th><th>Owner</th>
+          <th>Customer's Time</th><th>Our Time (CPH)</th><th>Message</th><th>Status</th><th>Owner</th>
         </tr></thead>
         <tbody>{rows_html}</tbody>
       </table>
